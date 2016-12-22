@@ -107,6 +107,79 @@ func resourceServiceV1() *schema.Resource {
 				Description: "The default hostname for the version",
 			},
 
+			"healthcheck": &schema.Schema{
+				Type:     schema.TypeSet,
+				Optional: true,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						// required fields
+						"name": &schema.Schema{
+							Type:        schema.TypeString,
+							Required:    true,
+							Description: "The name of the healthcheck",
+						},
+						"host": &schema.Schema{
+							Type:        schema.TypeString,
+							Required:    true,
+							Description: "Which host to check",
+						},
+						"path": &schema.Schema{
+							Type:        schema.TypeString,
+							Required:    true,
+							Description: "The path to check",
+						},
+
+						// optional fields
+						"check_interval": &schema.Schema{
+							Type:        schema.TypeInt,
+							Optional:    true,
+							Description: "How often to run the healthcheck in milliseconds",
+						},
+						"comment": &schema.Schema{
+							Type:        schema.TypeString,
+							Optional:    true,
+							Description: "A comment",
+						},
+						"expected_response": &schema.Schema{
+							Type:        schema.TypeInt,
+							Optional:    true,
+							Description: "The status code expected from the host",
+						},
+						"http_version": &schema.Schema{
+							Type:        schema.TypeString,
+							Optional:    true,
+							Default:     "1.1",
+							Description: "Whether to use version 1.0 or 1.1 HTTP",
+						},
+						"initial": &schema.Schema{
+							Type:        schema.TypeInt,
+							Optional:    true,
+							Description: "When loading a config, the initial number of probes to be seen as OK",
+						},
+						"method": &schema.Schema{
+							Type:        schema.TypeString,
+							Optional:    true,
+							Description: "Which HTTP method to use",
+						},
+						"threshold": &schema.Schema{
+							Type:        schema.TypeInt,
+							Optional:    true,
+							Description: "How many healthchecks must succeed to be considered healthy",
+						},
+						"timeout": &schema.Schema{
+							Type:        schema.TypeInt,
+							Optional:    true,
+							Description: "Timeout in milliseconds",
+						},
+						"window": &schema.Schema{
+							Type:        schema.TypeInt,
+							Optional:    true,
+							Description: "The number of most recent healthcheck queries to keep for this healthcheck",
+						},
+					},
+				},
+			},
+
 			"backend": &schema.Schema{
 				Type:     schema.TypeSet,
 				Required: true,
@@ -153,6 +226,12 @@ func resourceServiceV1() *schema.Resource {
 							Optional:    true,
 							Default:     15000,
 							Description: "How long to wait for the first bytes in milliseconds",
+						},
+						"healthcheck": &schema.Schema{
+							Type:        schema.TypeString,
+							Optional:    true,
+							Default:     "",
+							Description: "The name of the healthcheck to use with this backend",
 						},
 						"max_conn": &schema.Schema{
 							Type:        schema.TypeInt,
@@ -608,6 +687,7 @@ func resourceServiceV1Update(d *schema.ResourceData, meta interface{}) error {
 		"default_host",
 		"default_ttl",
 		"header",
+		"healthcheck",
 		"gzip",
 		"s3logging",
 		"condition",
@@ -783,6 +863,65 @@ func resourceServiceV1Update(d *schema.ResourceData, meta interface{}) error {
 			}
 		}
 
+		if d.HasChange("healthcheck") {
+			oh, nh := d.GetChange("healthcheck")
+			if oh == nil {
+				oh = new(schema.Set)
+			}
+			if nh == nil {
+				nh = new(schema.Set)
+			}
+
+			ohs := oh.(*schema.Set)
+			nhs := nh.(*schema.Set)
+
+			remove := ohs.Difference(nhs).List()
+			add := nhs.Difference(ohs).List()
+
+			// Delete removed healthchecks
+			for _, dRaw := range remove {
+				df := dRaw.(map[string]interface{})
+				opts := gofastly.DeleteHealthCheckInput{
+					Service: d.Id(),
+					Version: latestVersion,
+					Name:    df["name"].(string),
+				}
+
+				log.Printf("[DEBUG] Fastly Healthcheck removal opts: %#v", opts)
+				err := conn.DeleteHealthCheck(&opts)
+				if err != nil {
+					return err
+				}
+			}
+
+			// POST new healthchecks
+			for _, dRaw := range add {
+				df := dRaw.(map[string]interface{})
+				opts := gofastly.CreateHealthCheckInput{
+					Service:          d.Id(),
+					Version:          latestVersion,
+					Name:             df["name"].(string),
+					Host:             df["host"].(string),
+					Path:             df["path"].(string),
+					CheckInterval:    uint(df["check_interval"].(int)),
+					ExpectedResponse: uint(df["expected_response"].(int)),
+					HTTPVersion:      df["http_version"].(string),
+					Initial:          uint(df["initial"].(int)),
+					Method:           df["method"].(string),
+					Threshold:        uint(df["threshold"].(int)),
+					Timeout:          uint(df["timeout"].(int)),
+					Window:           uint(df["window"].(int)),
+				}
+
+				log.Printf("[DEBUG] Fastly Healthcheck Addition opts: %#v", opts)
+				_, err := conn.CreateHealthCheck(&opts)
+				if err != nil {
+					log.Printf("[DEBUG] Error building Healthcheck: %s", err)
+					return err
+				}
+			}
+		}
+
 		// find difference in backends
 		if d.HasChange("backend") {
 			ob, nb := d.GetChange("backend")
@@ -833,6 +972,7 @@ func resourceServiceV1Update(d *schema.ResourceData, meta interface{}) error {
 					FirstByteTimeout:    uint(df["first_byte_timeout"].(int)),
 					MaxConn:             uint(df["max_conn"].(int)),
 					Weight:              uint(df["weight"].(int)),
+					HealthCheck:         df["healthcheck"].(string),
 				}
 
 				log.Printf("[DEBUG] Create Backend Opts: %#v", opts)
@@ -1287,6 +1427,22 @@ func resourceServiceV1Read(d *schema.ResourceData, meta interface{}) error {
 			log.Printf("[WARN] Error setting Domains for (%s): %s", d.Id(), err)
 		}
 
+		// Refresh Healthchecks
+		healthCheckList, err := conn.ListHealthChecks(&gofastly.ListHealthChecksInput{
+			Service: d.Id(),
+			Version: s.ActiveVersion.Number,
+		})
+
+		if err != nil {
+			return fmt.Errorf("[ERR] Error looking up Healthchecks for (%s), version (%s): %s", d.Id(), s.ActiveVersion.Number, err)
+		}
+
+		hcl := flattenHealthChecks(healthCheckList)
+
+		if err := d.Set("healthcheck", hcl); err != nil {
+			log.Printf("[WARN] Error setting Healthchecks for (%s), version (%s): %s", d.Id(), s.ActiveVersion.Number, err)
+		}
+
 		// Refresh Backends
 		log.Printf("[DEBUG] Refreshing Backends for (%s)", d.Id())
 		backendList, err := conn.ListBackends(&gofastly.ListBackendsInput{
@@ -1490,6 +1646,28 @@ func flattenDomains(list []*gofastly.Domain) []map[string]interface{} {
 	}
 
 	return dl
+}
+
+func flattenHealthChecks(healthCheckList []*gofastly.HealthCheck) []map[string]interface{} {
+	var hcl []map[string]interface{}
+	for _, hc := range healthCheckList {
+		// Convert healthcheck to a map to save state.
+		ncl := map[string]interface{}{
+			"name":              hc.Name,
+			"host":              hc.Host,
+			"path":              hc.Path,
+			"check_interval":    int(hc.CheckInterval),
+			"expected_response": int(hc.ExpectedResponse),
+			"http_version":      hc.HTTPVersion,
+			"initial":           int(hc.Initial),
+			"method":            hc.Method,
+			"threshold":         int(hc.Threshold),
+			"timeout":           int(hc.Timeout),
+			"window":            int(hc.Window),
+		}
+		hcl = append(hcl, ncl)
+	}
+	return hcl
 }
 
 func flattenBackends(backendList []*gofastly.Backend) []map[string]interface{} {
